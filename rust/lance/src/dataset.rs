@@ -233,6 +233,11 @@ impl ProjectionRequest {
         Self::Schema(Arc::new(schema))
     }
 
+    /// Provide a list of projection with SQL transform.
+    ///
+    /// # Parameters
+    /// - `columns`: A list of tuples where the first element is resulted column name and the second
+    ///              element is the SQL expression.
     pub fn from_sql(
         columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
@@ -249,6 +254,18 @@ impl ProjectionRequest {
             Self::Schema(schema) => Ok(ProjectionPlan::new_empty(schema)),
             Self::Sql(columns) => ProjectionPlan::try_new(dataset_schema, &columns),
         }
+    }
+}
+
+impl From<Arc<Schema>> for ProjectionRequest {
+    fn from(schema: Arc<Schema>) -> Self {
+        Self::Schema(schema)
+    }
+}
+
+impl From<Schema> for ProjectionRequest {
+    fn from(schema: Schema) -> Self {
+        Self::from(Arc::new(schema))
     }
 }
 
@@ -912,118 +929,6 @@ impl Dataset {
         })
     }
 
-    /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
-    ///
-    /// Parameters:
-    ///
-    /// - `stream`: the stream of [`RecordBatch`] to merge.
-    /// - `left_on`: the column name to join on the left side (self).
-    /// - `right_on`: the column name to join on the right side (stream).
-    ///
-    /// Returns: a new version of dataset.
-    ///
-    /// It performs a left-join on the two datasets.
-    async fn merge_impl(
-        &mut self,
-        stream: Box<dyn RecordBatchReader + Send>,
-        left_on: &str,
-        right_on: &str,
-    ) -> Result<()> {
-        // Sanity check.
-        if self.schema().field(left_on).is_none() {
-            return Err(Error::invalid_input(
-                format!("Column {} does not exist in the left side dataset", left_on),
-                location!(),
-            ));
-        };
-        let right_schema = stream.schema();
-        if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Column {} does not exist in the right side dataset",
-                    right_on
-                ),
-                location!(),
-            ));
-        };
-        for field in right_schema.fields() {
-            if field.name() == right_on {
-                // right_on is allowed to exist in the dataset, since it may be
-                // the same as left_on.
-                continue;
-            }
-            if self.schema().field(field.name()).is_some() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} exists in both sides of the dataset",
-                        field.name()
-                    ),
-                    location!(),
-                ));
-            }
-        }
-
-        // Hash join
-        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
-        // Final schema is union of current schema, plus the RHS schema without
-        // the right_on key.
-        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(self.manifest.max_field_id()));
-
-        // Write new data file to each fragment. Parallelism is done over columns,
-        // so no parallelism done at this level.
-        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
-            .then(|f| {
-                let joiner = joiner.clone();
-                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::Merge {
-                fragments: updated_fragments,
-                schema: new_schema,
-            },
-            None,
-        );
-
-        let manifest = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-        )
-        .await?;
-
-        self.manifest = Arc::new(manifest);
-
-        Ok(())
-    }
-
-    pub async fn merge(
-        &mut self,
-        stream: impl RecordBatchReader + Send + 'static,
-        left_on: &str,
-        right_on: &str,
-    ) -> Result<()> {
-        let stream = Box::new(stream);
-        self.merge_impl(stream, left_on, right_on).await
-    }
-
-    /// Drop columns from the dataset and return updated dataset. Note that this
-    /// is a zero-copy operation and column is not physically removed from the
-    /// dataset.
-    /// Parameters:
-    /// - `columns`: the list of column names to drop.
-    #[deprecated(since = "0.9.12", note = "Please use `drop_columns` instead.")]
-    pub async fn drop(&mut self, columns: &[&str]) -> Result<()> {
-        self.drop_columns(columns).await
-    }
-
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -1053,30 +958,64 @@ impl Dataset {
         }
     }
 
+    /// Take rows by indices.
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
     pub async fn take(
         &self,
         row_indices: &[u64],
-        projection: ProjectionRequest,
+        projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
         take::take(
             self,
             row_indices,
-            &projection.into_projection_plan(self.schema())?,
+            &projection.into().into_projection_plan(self.schema())?,
         )
         .await
     }
 
-    /// Take rows by the internal ROW ids.
+    /// Take Rows by the internal ROW ids.
+    ///
+    /// In Lance format, each row has a unique `u64` id, which is used to identify the row globally.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int64Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use lance::dataset::{WriteParams, Dataset, ProjectionRequest};
+    /// #
+    /// # let mut rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let test_dir = tempfile::tempdir().unwrap();
+    /// # let uri = test_dir.path().to_str().unwrap().to_string();
+    /// #
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// # let write_params = WriteParams::default();
+    /// # let array = Arc::new(Int64Array::from_iter(0..128));
+    /// # let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    /// # let reader = RecordBatchIterator::new(
+    /// #    vec![batch].into_iter().map(Ok), schema
+    /// # );
+    /// # let dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
+    /// #
+    /// let schema = dataset.schema().clone();
+    /// let row_ids = vec![0, 4, 7];
+    /// let rows = dataset.take_rows(&row_ids, schema).await.unwrap();
+    ///
+    /// // We can have more fine-grained control over the projection, i.e., SQL projection.
+    /// let projection = ProjectionRequest::from_sql([("identity", "id * 2")]);
+    /// let rows = dataset.take_rows(&row_ids, projection).await.unwrap();
+    /// # });
+    /// ```
     pub async fn take_rows(
         &self,
         row_ids: &[u64],
-        projection: ProjectionRequest,
+        projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
         take::take_rows(
             self,
             row_ids,
-            &projection.into_projection_plan(self.schema())?,
+            &projection.into().into_projection_plan(self.schema())?,
         )
         .await
     }
@@ -1098,8 +1037,7 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
         let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
-        self.take(&ids, ProjectionRequest::from_schema(projection.clone()))
-            .await
+        self.take(&ids, projection.clone()).await
     }
 
     /// Delete rows based on a predicate.
@@ -1312,6 +1250,21 @@ impl Dataset {
 }
 
 /// # Schema Evolution
+///
+/// Lance datasets support evolving the schema. Several operations are
+/// supported that mirror common SQL operations:
+///
+/// - [Self::add_columns()]: Add new columns to the dataset, similar to `ALTER TABLE ADD COLUMN`.
+/// - [Self::drop_columns()]: Drop columns from the dataset, similar to `ALTER TABLE DROP COLUMN`.
+/// - [Self::alter_columns()]: Modify columns in the dataset, changing their name, type, or nullability.
+///                    Similar to `ALTER TABLE ALTER COLUMN`.
+///
+/// In addition, one operation is unique to Lance: [`merge`](Self::merge). This
+/// operation allows inserting precomputed data into the dataset.
+///
+/// Because these operations change the schema of the dataset, they will conflict
+/// with most other concurrent operations. Therefore, they should be performed
+/// when no other write operations are being run.
 impl Dataset {
     /// Append new columns to the dataset.
     pub async fn add_columns(
@@ -1324,7 +1277,12 @@ impl Dataset {
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
     ///
-    /// If a column has an index, it's index will be preserved.
+    /// If only changing the name or nullability of a column, this is a zero-copy
+    /// operation and any indices will be preserved. If changing the type of a
+    /// column, the data for that column will be rewritten and any indices will
+    /// be dropped. The old column data will not be immediately deleted. To remove
+    /// it, call [optimize::compact_files()] and then
+    /// [cleanup::cleanup_old_versions()] on the dataset.
     pub async fn alter_columns(&mut self, alterations: &[ColumnAlteration]) -> Result<()> {
         schema_evolution::alter_columns(self, alterations).await
     }
@@ -1333,10 +1291,122 @@ impl Dataset {
     ///
     /// This is a metadata-only operation and does not remove the data from the
     /// underlying storage. In order to remove the data, you must subsequently
-    /// call `compact_files` to rewrite the data without the removed columns and
-    /// then call `cleanup_old_versions` to remove the old files.
+    /// call [optimize::compact_files()] to rewrite the data without the removed columns and
+    /// then call [cleanup::cleanup_old_versions()] to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         schema_evolution::drop_columns(self, columns).await
+    }
+
+    /// Drop columns from the dataset and return updated dataset. Note that this
+    /// is a zero-copy operation and column is not physically removed from the
+    /// dataset.
+    /// Parameters:
+    /// - `columns`: the list of column names to drop.
+    #[deprecated(since = "0.9.12", note = "Please use `drop_columns` instead.")]
+    pub async fn drop(&mut self, columns: &[&str]) -> Result<()> {
+        self.drop_columns(columns).await
+    }
+
+    async fn merge_impl(
+        &mut self,
+        stream: Box<dyn RecordBatchReader + Send>,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<()> {
+        // Sanity check.
+        if self.schema().field(left_on).is_none() {
+            return Err(Error::invalid_input(
+                format!("Column {} does not exist in the left side dataset", left_on),
+                location!(),
+            ));
+        };
+        let right_schema = stream.schema();
+        if right_schema.field_with_name(right_on).is_err() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the right side dataset",
+                    right_on
+                ),
+                location!(),
+            ));
+        };
+        for field in right_schema.fields() {
+            if field.name() == right_on {
+                // right_on is allowed to exist in the dataset, since it may be
+                // the same as left_on.
+                continue;
+            }
+            if self.schema().field(field.name()).is_some() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} exists in both sides of the dataset",
+                        field.name()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        // Hash join
+        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
+        // Final schema is union of current schema, plus the RHS schema without
+        // the right_on key.
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(Some(self.manifest.max_field_id()));
+
+        // Write new data file to each fragment. Parallelism is done over columns,
+        // so no parallelism done at this level.
+        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
+            .then(|f| {
+                let joiner = joiner.clone();
+                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
+                fragments: updated_fragments,
+                schema: new_schema,
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
+    /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
+    ///
+    /// Parameters:
+    ///
+    /// - `stream`: the stream of [`RecordBatch`] to merge.
+    /// - `left_on`: the column name to join on the left side (self).
+    /// - `right_on`: the column name to join on the right side (stream).
+    ///
+    /// Returns: a new version of dataset.
+    ///
+    /// It performs a left-join on the two datasets.
+    pub async fn merge(
+        &mut self,
+        stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<()> {
+        let stream = Box::new(stream);
+        self.merge_impl(stream, left_on, right_on).await
     }
 }
 
@@ -1347,12 +1417,7 @@ impl DatasetTakeRows for Dataset {
     }
 
     async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
-        Self::take_rows(
-            self,
-            row_ids,
-            ProjectionRequest::from_schema(projection.clone()),
-        )
-        .await
+        Self::take_rows(self, row_ids, projection.clone()).await
     }
 }
 
