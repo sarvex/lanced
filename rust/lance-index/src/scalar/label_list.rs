@@ -17,20 +17,24 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use crate::{Index, IndexType};
-
-use super::SearchResult;
 use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
     bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
 };
+use super::{MetricsCollector, SearchResult};
+use crate::frag_reuse::FragReuseIndex;
+use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
 #[async_trait]
 trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
-    async fn search_exact(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
-        let result = self.search(query).await?;
+    async fn search_exact(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        let result = self.search(query, metrics).await?;
         match result {
             SearchResult::Exact(row_ids) => Ok(row_ids),
             _ => Err(Error::Internal {
@@ -74,6 +78,10 @@ impl Index for LabelListIndex {
         })
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        self.values_index.prewarm().await
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::LabelList
     }
@@ -91,11 +99,12 @@ impl LabelListIndex {
     fn search_values<'a>(
         &'a self,
         values: &'a Vec<ScalarValue>,
+        metrics: &'a dyn MetricsCollector,
     ) -> BoxStream<'a, Result<RowIdTreeMap>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
-                async move { self.values_index.search_exact(&value_query).await }
+                async move { self.values_index.search_exact(&value_query, metrics).await }
             })
             .boxed()
     }
@@ -125,7 +134,7 @@ impl LabelListIndex {
             return Ok(intersect_bitmap);
         }
         while let Some(next) = sets.try_next().await? {
-            intersect_bitmap &= next;
+            intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
     }
@@ -133,18 +142,22 @@ impl LabelListIndex {
 
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
-    #[instrument(skip(self), level = "debug")]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    #[instrument(skip_all, level = "debug")]
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         let row_ids = match query {
             LabelListQuery::HasAllLabels(labels) => {
-                let values_results = self.search_values(labels);
+                let values_results = self.search_values(labels, metrics);
                 self.set_intersection(values_results, labels.len() == 1)
                     .await
             }
             LabelListQuery::HasAnyLabel(labels) => {
-                let values_results = self.search_values(labels);
+                let values_results = self.search_values(labels, metrics);
                 self.set_union(values_results, labels.len() == 1).await
             }
         }?;
@@ -155,8 +168,11 @@ impl ScalarIndex for LabelListIndex {
         true
     }
 
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
-        BitmapIndex::load(store)
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>> {
+        BitmapIndex::load(store, fri)
             .await
             .map(|index| Arc::new(Self::new(index)))
     }

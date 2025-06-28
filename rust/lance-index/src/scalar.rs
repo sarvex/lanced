@@ -3,7 +3,7 @@
 
 //! Scalar indices for metadata search & filtering
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
@@ -19,11 +19,12 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
-use inverted::TokenizerConfig;
+use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::location;
 
+use crate::metrics::MetricsCollector;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
@@ -35,9 +36,12 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 
+use crate::frag_reuse::FragReuseIndex;
+pub use inverted::tokenizer::InvertedIndexParams;
+
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
@@ -60,6 +64,18 @@ impl TryFrom<IndexType> for ScalarIndexType {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
                 location: location!(),
             }),
+        }
+    }
+}
+
+impl From<ScalarIndexType> for IndexType {
+    fn from(val: ScalarIndexType) -> Self {
+        match val {
+            ScalarIndexType::BTree => Self::BTree,
+            ScalarIndexType::Bitmap => Self::Bitmap,
+            ScalarIndexType::LabelList => Self::LabelList,
+            ScalarIndexType::NGram => Self::NGram,
+            ScalarIndexType::Inverted => Self::Inverted,
         }
     }
 }
@@ -95,47 +111,6 @@ impl IndexParams for ScalarIndexParams {
 
     fn index_name(&self) -> &str {
         LANCE_SCALAR_INDEX
-    }
-}
-
-#[derive(Clone)]
-pub struct InvertedIndexParams {
-    /// If true, store the position of the term in the document
-    /// This can significantly increase the size of the index
-    /// If false, only store the frequency of the term in the document
-    /// Default is true
-    pub with_position: bool,
-
-    pub tokenizer_config: TokenizerConfig,
-}
-
-impl Debug for InvertedIndexParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InvertedIndexParams")
-            .field("with_position", &self.with_position)
-            .finish()
-    }
-}
-
-impl DeepSizeOf for InvertedIndexParams {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-impl Default for InvertedIndexParams {
-    fn default() -> Self {
-        Self {
-            with_position: true,
-            tokenizer_config: TokenizerConfig::default(),
-        }
-    }
-}
-
-impl InvertedIndexParams {
-    pub fn with_position(mut self, with_position: bool) -> Self {
-        self.with_position = with_position;
-        self
     }
 }
 
@@ -181,7 +156,7 @@ pub trait IndexReader: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
     /// Return the number of batches in the file
-    async fn num_batches(&self) -> u32;
+    async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
@@ -211,6 +186,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+
+    /// Rename an index file
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()>;
+
+    /// Delete an index file (used in the tmp spill store to keep tmp size down)
+    async fn delete_index_file(&self, name: &str) -> Result<()>;
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -243,17 +224,14 @@ impl PartialEq for dyn AnyQuery {
         self.dyn_eq(other)
     }
 }
-
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
-    /// The columns to search,
-    /// if empty, search all indexed columns
-    pub columns: Vec<String>,
-    /// The full text search query
-    pub query: String,
+    pub query: FtsQuery,
+
     /// The maximum number of results to return
     pub limit: Option<i64>,
+
     /// The wand factor to use for ranking
     /// if None, use the default value of 1.0
     /// Increasing this value will reduce the recall and improve the performance
@@ -262,22 +240,51 @@ pub struct FullTextSearchQuery {
 }
 
 impl FullTextSearchQuery {
+    /// Create a new terms query
     pub fn new(query: String) -> Self {
+        let query = MatchQuery::new(query).into();
         Self {
             query,
             limit: None,
-            columns: vec![],
             wand_factor: None,
         }
     }
 
-    pub fn columns(mut self, columns: Option<Vec<String>>) -> Self {
-        if let Some(columns) = columns {
-            self.columns = columns;
+    /// Create a new fuzzy query
+    pub fn new_fuzzy(term: String, max_distance: Option<u32>) -> Self {
+        let query = MatchQuery::new(term).with_fuzziness(max_distance).into();
+        Self {
+            query,
+            limit: None,
+            wand_factor: None,
         }
-        self
     }
 
+    /// Create a new compound query
+    pub fn new_query(query: FtsQuery) -> Self {
+        Self {
+            query,
+            limit: None,
+            wand_factor: None,
+        }
+    }
+
+    /// Set the column to search over
+    /// This is available for only MatchQuery and PhraseQuery
+    pub fn with_column(mut self, column: String) -> Result<Self> {
+        self.query = fill_fts_query_column(&self.query, &[column], true)?;
+        Ok(self)
+    }
+
+    /// Set the column to search over
+    /// This is available for only MatchQuery
+    pub fn with_columns(mut self, columns: &[String]) -> Result<Self> {
+        self.query = fill_fts_query_column(&self.query, columns, true)?;
+        Ok(self)
+    }
+
+    /// limit the number of results to return
+    /// if None, return all results
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
         self
@@ -286,6 +293,20 @@ impl FullTextSearchQuery {
     pub fn wand_factor(mut self, wand_factor: Option<f32>) -> Self {
         self.wand_factor = wand_factor;
         self
+    }
+
+    pub fn columns(&self) -> HashSet<String> {
+        self.query.columns()
+    }
+
+    pub fn params(&self) -> FtsSearchParams {
+        let params = FtsSearchParams::new()
+            .with_limit(self.limit.map(|limit| limit as usize))
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
+        match self.query {
+            FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
+            _ => params,
+        }
     }
 }
 
@@ -399,9 +420,9 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(query) => {
-                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(query.query.clone()))))
-            }
+            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(
+                query.query.to_string(),
+            )))),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone())),
         }
@@ -530,7 +551,7 @@ impl AnyQuery for TextQuery {
 }
 
 /// The result of a search operation against a scalar index
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
     Exact(RowIdTreeMap),
@@ -565,7 +586,11 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
     /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult>;
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult>;
 
     /// Returns true if the query can be answered exactly
     ///
@@ -574,7 +599,10 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
 
     /// Load the scalar index from storage
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>>
     where
         Self: Sized;
 

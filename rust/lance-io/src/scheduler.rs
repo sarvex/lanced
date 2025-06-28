@@ -9,6 +9,7 @@ use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
+use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
+use crate::utils::CachedFileSize;
 
 // Don't log backpressure warnings until at least this many seconds have passed
 const BACKPRESSURE_MIN: u64 = 5;
@@ -29,6 +31,19 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+// By default, we limit the number of IOPS across the entire process to 128
+//
+// In theory this is enough for ~10GBps on S3 following the guidelines to issue
+// 1 IOP per 80MBps.  In practice, I have noticed slightly better performance going
+// up to 256.
+//
+// However, non-S3 stores (e.g. GCS, Azure) can suffer significantly from too many
+// concurrent IOPS.  For safety, we set the default to 128 and let the user override
+// this if needed.
+//
+// Note: this only limits things that run through the scheduler.  It does not limit
+// IOPS from other sources like writing or commits.
+static DEFAULT_PROCESS_IOPS_LIMIT: i32 = 128;
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -87,24 +102,20 @@ impl IopsReservation<'_> {
 }
 
 impl IopsQuota {
-    // By default, there is no process-wide limit on IOPS
+    // By default, we throttle the number of scan IOPS across the entire process
     //
-    // However, the user can request one by setting the environment variable
-    // LANCE_PROCESS_IO_THREADS_LIMIT to a positive integer.
+    // However, the user can disable this by setting the environment variable
+    // LANCE_PROCESS_IO_THREADS_LIMIT to zero (or a negative integer).
     fn new() -> Self {
         let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
             .map(|s| {
-                let limit = s
-                    .parse::<i32>()
-                    .expect("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer");
-                if limit <= 0 {
-                    panic!("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer.  To disable the limit, unset the environment variable");
-                }
-                limit
+                s.parse::<i32>().unwrap_or_else(|_| {
+                    log::warn!("Ignoring invalid LANCE_PROCESS_IO_THREADS_LIMIT: {}", s);
+                    DEFAULT_PROCESS_IOPS_LIMIT
+                })
             })
-            // The default (-1) does not apply any limit
-            .unwrap_or(-1);
-        let iops_avail = if initial_capacity < 0 {
+            .unwrap_or(DEFAULT_PROCESS_IOPS_LIMIT);
+        let iops_avail = if initial_capacity <= 0 {
             None
         } else {
             Some(Semaphore::new(initial_capacity as usize))
@@ -221,7 +232,7 @@ impl IoQueueState {
             && seconds_elapsed < BACKPRESSURE_DEBOUNCE)
             || since_last_warn > BACKPRESSURE_DEBOUNCE
         {
-            tracing::event!(tracing::Level::WARN, "Backpressure throttle exceeded");
+            tracing::event!(tracing::Level::DEBUG, "Backpressure throttle exceeded");
             log::debug!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
             self.last_warn
                 .store(seconds_elapsed.max(1), Ordering::Release);
@@ -497,6 +508,60 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
     }
 }
 
+#[derive(Debug)]
+struct StatsCollector {
+    iops: AtomicU64,
+    requests: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+impl StatsCollector {
+    fn new() -> Self {
+        Self {
+            iops: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+        }
+    }
+
+    fn iops(&self) -> u64 {
+        self.iops.load(Ordering::Relaxed)
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    fn record_request(&self, request: &[Range<u64>]) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.iops.fetch_add(request.len() as u64, Ordering::Relaxed);
+        self.bytes_read.fetch_add(
+            request.iter().map(|r| r.end - r.start).sum::<u64>(),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+pub struct ScanStats {
+    pub iops: u64,
+    pub requests: u64,
+    pub bytes_read: u64,
+}
+
+impl ScanStats {
+    fn new(stats: &StatsCollector) -> Self {
+        Self {
+            iops: stats.iops(),
+            requests: stats.requests(),
+            bytes_read: stats.bytes_read(),
+        }
+    }
+}
+
 /// An I/O scheduler which wraps an ObjectStore and throttles the amount of
 /// parallel I/O that can be run.
 ///
@@ -504,6 +569,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
 pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: Arc<IoQueue>,
+    stats: Arc<StatsCollector>,
 }
 
 impl Debug for ScanScheduler {
@@ -562,6 +628,7 @@ impl ScanScheduler {
         let scheduler = Self {
             object_store,
             io_queue: io_queue.clone(),
+            stats: Arc::new(StatsCollector::new()),
         };
         tokio::task::spawn(async move { run_io_loop(io_queue).await });
         Arc::new(scheduler)
@@ -573,28 +640,47 @@ impl ScanScheduler {
     ///
     /// * path - the path to the file to open
     /// * base_priority - the base priority for I/O requests submitted to this file scheduler
-    ///                   this will determine the upper 64 bits of priority (the lower 64 bits
-    ///                   come from `submit_request` and `submit_single`)
+    ///   this will determine the upper 64 bits of priority (the lower 64 bits
+    ///   come from `submit_request` and `submit_single`)
     pub async fn open_file_with_priority(
         self: &Arc<Self>,
         path: &Path,
         base_priority: u64,
+        file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
-        let reader = self.object_store.open(path).await?;
+        let file_size_bytes = if let Some(size) = file_size_bytes.get() {
+            u64::from(size)
+        } else {
+            let size = self.object_store.size(path).await?;
+            if let Some(size) = NonZero::new(size) {
+                file_size_bytes.set(size);
+            }
+            size
+        };
+        let reader = self
+            .object_store
+            .open_with_size(path, file_size_bytes as usize)
+            .await?;
         let block_size = self.object_store.block_size() as u64;
+        let max_iop_size = self.object_store.max_iop_size();
         Ok(FileScheduler {
             reader: reader.into(),
             block_size,
             root: self.clone(),
             base_priority,
+            max_iop_size,
         })
     }
 
     /// Open a file with a default priority of 0
     ///
     /// See [`Self::open_file_with_priority`] for more information on the priority
-    pub async fn open_file(self: &Arc<Self>, path: &Path) -> Result<FileScheduler> {
-        self.open_file_with_priority(path, 0).await
+    pub async fn open_file(
+        self: &Arc<Self>,
+        path: &Path,
+        file_size_bytes: &CachedFileSize,
+    ) -> Result<FileScheduler> {
+        self.open_file_with_priority(path, 0, file_size_bytes).await
     }
 
     fn do_submit_request(
@@ -661,6 +747,10 @@ impl ScanScheduler {
             rsp.data
         })
     }
+
+    pub fn stats(&self) -> ScanStats {
+        ScanStats::new(self.stats.as_ref())
+    }
 }
 
 impl Drop for ScanScheduler {
@@ -676,6 +766,7 @@ pub struct FileScheduler {
     root: Arc<ScanScheduler>,
     block_size: u64,
     base_priority: u64,
+    max_iop_size: u64,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -708,7 +799,7 @@ impl FileScheduler {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
-        let mut updated_requests = Vec::with_capacity(request.len());
+        let mut merged_requests = Vec::with_capacity(request.len());
 
         if !request.is_empty() {
             let mut curr_interval = request[0].clone();
@@ -717,13 +808,35 @@ impl FileScheduler {
                 if is_close_together(&curr_interval, req, self.block_size) {
                     curr_interval.end = curr_interval.end.max(req.end);
                 } else {
-                    updated_requests.push(curr_interval);
+                    merged_requests.push(curr_interval);
                     curr_interval = req.clone();
                 }
             }
 
-            updated_requests.push(curr_interval);
+            merged_requests.push(curr_interval);
         }
+
+        let mut updated_requests = Vec::with_capacity(merged_requests.len());
+        for req in merged_requests {
+            if req.is_empty() {
+                updated_requests.push(req);
+            } else {
+                let num_requests = (req.end - req.start).div_ceil(self.max_iop_size);
+                let bytes_per_request = (req.end - req.start) / num_requests;
+                for i in 0..num_requests {
+                    let start = req.start + i * bytes_per_request;
+                    let end = if i == num_requests - 1 {
+                        // Last request is a bit bigger due to rounding
+                        req.end
+                    } else {
+                        start + bytes_per_request
+                    };
+                    updated_requests.push(start..end);
+                }
+            }
+        }
+
+        self.root.stats.record_request(&updated_requests);
 
         let bytes_vec_fut =
             self.root
@@ -742,13 +855,32 @@ impl FileScheduler {
                 let byte_offset = updated_range.start as usize;
 
                 if is_overlapping(updated_range, orig_range) {
-                    // Rescale the ranges since they correspond to the entire set of bytes, while
-                    // But we need to slice into a subset of the bytes in a particular index of bytes_vec
+                    // We need to undo the coalescing and splitting done earlier
                     let start = orig_range.start as usize - byte_offset;
-                    let end = orig_range.end as usize - byte_offset;
-
-                    let sliced_range = bytes_vec[updated_index].slice(start..end);
-                    final_bytes.push(sliced_range);
+                    if orig_range.end <= updated_range.end {
+                        // The original range is fully contained in the updated range, can do
+                        // zero-copy slice
+                        let end = orig_range.end as usize - byte_offset;
+                        final_bytes.push(bytes_vec[updated_index].slice(start..end));
+                    } else {
+                        // The original read was split into multiple requests, need to copy
+                        // back into a single buffer
+                        let orig_size = orig_range.end - orig_range.start;
+                        let mut merged_bytes = Vec::with_capacity(orig_size as usize);
+                        merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
+                        let mut copy_offset = merged_bytes.len() as u64;
+                        while copy_offset < orig_size {
+                            updated_index += 1;
+                            let next_range = &updated_requests[updated_index];
+                            let bytes_to_take =
+                                (orig_size - copy_offset).min(next_range.end - next_range.start);
+                            merged_bytes.extend_from_slice(
+                                &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
+                            );
+                            copy_offset += bytes_to_take;
+                        }
+                        final_bytes.push(Bytes::from(merged_bytes));
+                    }
                     orig_index += 1;
                 } else {
                     updated_index += 1;
@@ -756,6 +888,16 @@ impl FileScheduler {
             }
 
             Ok(final_bytes)
+        }
+    }
+
+    pub fn with_priority(&self, priority: u64) -> Self {
+        Self {
+            reader: self.reader.clone(),
+            root: self.root.clone(),
+            block_size: self.block_size,
+            max_iop_size: self.max_iop_size,
+            base_priority: priority,
         }
     }
 
@@ -796,7 +938,10 @@ mod tests {
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 
-    use crate::{object_store::DEFAULT_DOWNLOAD_RETRY_COUNT, testing::MockObjectStore};
+    use crate::{
+        object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, DEFAULT_MAX_IOP_SIZE},
+        testing::MockObjectStore,
+    };
 
     use super::*;
 
@@ -819,7 +964,10 @@ mod tests {
 
         let scheduler = ScanScheduler::new(obj_store, config);
 
-        let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+        let file_scheduler = scheduler
+            .open_file(&tmp_file, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         // Read it back 4KiB at a time
         const READ_SIZE: u64 = 4 * 1024;
@@ -845,6 +993,93 @@ mod tests {
             assert_eq!(expected, actual);
             offset += READ_SIZE;
         }
+    }
+
+    #[tokio::test]
+    async fn test_split_coalesce() {
+        let tmpdir = tempdir().unwrap();
+        let tmp_path = tmpdir.path().to_str().unwrap();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_file = tmp_path.child("foo.file");
+
+        let obj_store = Arc::new(ObjectStore::local());
+
+        // Write 75MiB of data
+        const DATA_SIZE: u64 = 75 * 1024 * 1024;
+        let mut some_data = vec![0; DATA_SIZE as usize];
+        rand::thread_rng().fill_bytes(&mut some_data);
+        obj_store.put(&tmp_file, &some_data).await.unwrap();
+
+        let config = SchedulerConfig::default_for_testing();
+
+        let scheduler = ScanScheduler::new(obj_store, config);
+
+        let file_scheduler = scheduler
+            .open_file(&tmp_file, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        // These 3 requests should be coalesced into a single I/O because they are within 4KiB
+        // of each other
+        let req =
+            file_scheduler.submit_request(vec![50_000..51_000, 52_000..53_000, 54_000..55_000], 0);
+
+        let bytes = req.await.unwrap();
+
+        assert_eq!(bytes[0], &some_data[50_000..51_000]);
+        assert_eq!(bytes[1], &some_data[52_000..53_000]);
+        assert_eq!(bytes[2], &some_data[54_000..55_000]);
+
+        assert_eq!(1, scheduler.stats().iops);
+
+        // This should be split into 5 requests because it is so large
+        let req = file_scheduler.submit_request(vec![0..DATA_SIZE], 0);
+        let bytes = req.await.unwrap();
+        assert!(bytes[0] == some_data, "data is not the same");
+
+        assert_eq!(6, scheduler.stats().iops);
+
+        // None of these requests are bigger than the max IOP size but they will be coalesced into
+        // one IOP that is bigger and then split back into 2 requests that don't quite align with the original
+        // ranges.
+        let chunk_size = *DEFAULT_MAX_IOP_SIZE;
+        let req = file_scheduler.submit_request(
+            vec![
+                10..chunk_size,
+                chunk_size + 10..(chunk_size * 2) - 20,
+                chunk_size * 2..(chunk_size * 2) + 10,
+            ],
+            0,
+        );
+
+        let bytes = req.await.unwrap();
+        let chunk_size = chunk_size as usize;
+        assert!(
+            bytes[0] == some_data[10..chunk_size],
+            "data is not the same"
+        );
+        assert!(
+            bytes[1] == some_data[chunk_size + 10..(chunk_size * 2) - 20],
+            "data is not the same"
+        );
+        assert!(
+            bytes[2] == some_data[chunk_size * 2..(chunk_size * 2) + 10],
+            "data is not the same"
+        );
+        assert_eq!(8, scheduler.stats().iops);
+
+        let reads = (0..44)
+            .map(|i| (i * 1_000_000..(i + 1) * 1_000_000))
+            .collect::<Vec<_>>();
+        let req = file_scheduler.submit_request(reads, 0);
+        let bytes = req.await.unwrap();
+        for (i, bytes) in bytes.iter().enumerate() {
+            assert!(
+                bytes == &some_data[i * 1_000_000..(i + 1) * 1_000_000],
+                "data is not the same"
+            );
+        }
+        assert_eq!(11, scheduler.stats().iops);
     }
 
     #[tokio::test]
@@ -874,7 +1109,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
             Url::parse("mem://").unwrap(),
-            None,
+            Some(500),
             None,
             false,
             false,
@@ -889,7 +1124,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store, config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap())
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(1000))
             .await
             .unwrap();
 
@@ -955,7 +1190,7 @@ mod tests {
                     GetRange::Bounded(bounded) => bounded.end - bounded.start,
                     _ => panic!(),
                 };
-                bytes_read_copy.fetch_add(num_bytes as u64, Ordering::Release);
+                bytes_read_copy.fetch_add(num_bytes, Ordering::Release);
                 let location = location.clone();
                 let base_store = base_store.clone();
                 async move { base_store.get_opts(&location, options).await }.boxed()
@@ -963,7 +1198,7 @@ mod tests {
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
             Url::parse("mem://").unwrap(),
-            None,
+            Some(500),
             None,
             false,
             false,
@@ -978,7 +1213,7 @@ mod tests {
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
 
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap())
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(100000))
             .await
             .unwrap();
 
@@ -1051,7 +1286,7 @@ mod tests {
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
         let file_scheduler = scan_scheduler
-            .open_file(&Path::parse("foo").unwrap())
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(100000))
             .await
             .unwrap();
 
@@ -1080,7 +1315,10 @@ mod tests {
             io_buffer_size_bytes: 1,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
-        let file_scheduler = scan_scheduler.open_file(&some_path).await.unwrap();
+        let file_scheduler = scan_scheduler
+            .open_file(&some_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
 
         let mut futs = Vec::with_capacity(10000);
         for idx in 0..10000 {

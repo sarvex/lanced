@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Exec plan planner
 
@@ -28,15 +26,15 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
-    WindowUDF,
+    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
-    Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript, TimezoneInfo,
-    UnaryOperator, Value,
+    AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
+    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    ObjectNamePart, Subscript, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
@@ -49,6 +47,7 @@ use datafusion::{
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
+use lance_core::error::LanceOptionExt;
 use snafu::location;
 
 use lance_core::{Error, Result};
@@ -119,8 +118,8 @@ impl ScalarUDFImpl for CastListF16Udf {
         }
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> DFResult<ColumnarValue> {
-        let ColumnarValue::Array(arr) = &args[0] else {
+    fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let ColumnarValue::Array(arr) = &func_args.args[0] else {
             return Err(datafusion::error::DataFusionError::Execution(
                 "cast_list_f16 only supports array arguments".to_string(),
             ));
@@ -305,7 +304,7 @@ impl Planner {
             UnaryOperator::Minus => {
                 use datafusion::logical_expr::lit;
                 match expr {
-                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
+                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), ..}) => match n.parse::<i64>() {
                         Ok(n) => lit(-n),
                         Err(_) => lit(-n
                             .parse::<f64>()
@@ -403,8 +402,10 @@ impl Planner {
 
     fn parse_function(&self, function: SQLExpr) -> Result<Expr> {
         if let SQLExpr::Function(function) = &function {
-            if !function.name.0.is_empty() && function.name.0[0].value == "is_valid" {
-                return self.legacy_parse_function(function);
+            if let Some(ObjectNamePart::Identifier(name)) = &function.name.0.first() {
+                if &name.value == "is_valid" {
+                    return self.legacy_parse_function(function);
+                }
             }
         }
         let sql_to_rel = SqlToRel::new_with_options(
@@ -414,12 +415,16 @@ impl Planner {
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
+                collect_spans: false,
+                map_varchar_to_utf8view: false,
             },
         );
 
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-        Ok(sql_to_rel.sql_to_expr(function, &schema, &mut planner_context)?)
+        sql_to_rel
+            .sql_to_expr(function, &schema, &mut planner_context)
+            .map_err(|e| Error::invalid_input(format!("Error parsing function: {e}"), location!()))
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
@@ -442,18 +447,18 @@ impl Planner {
             SQLDataType::String(_) => Ok(ArrowDataType::Utf8),
             SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
             SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
-            SQLDataType::Double => Ok(ArrowDataType::Float64),
+            SQLDataType::Double(_) => Ok(ArrowDataType::Float64),
             SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
             SQLDataType::TinyInt(_) => Ok(ArrowDataType::Int8),
             SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
             SQLDataType::Int(_) | SQLDataType::Integer(_) => Ok(ArrowDataType::Int32),
             SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
-            SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
-            SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
-            SQLDataType::UnsignedInt(_) | SQLDataType::UnsignedInteger(_) => {
+            SQLDataType::TinyIntUnsigned(_) => Ok(ArrowDataType::UInt8),
+            SQLDataType::SmallIntUnsigned(_) => Ok(ArrowDataType::UInt16),
+            SQLDataType::IntUnsigned(_) | SQLDataType::IntegerUnsigned(_) => {
                 Ok(ArrowDataType::UInt32)
             }
-            SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
+            SQLDataType::BigIntUnsigned(_) => Ok(ArrowDataType::UInt64),
             SQLDataType::Date => Ok(ArrowDataType::Date32),
             SQLDataType::Timestamp(resolution, tz) => {
                 match tz {
@@ -553,7 +558,7 @@ impl Planner {
             SQLExpr::CompoundIdentifier(ids) => Ok(Self::column(ids.as_slice())),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
-            SQLExpr::Value(value) => self.value(value),
+            SQLExpr::Value(value) => self.value(&value.value),
             SQLExpr::Array(SQLArray { elem, .. }) => {
                 let mut values = vec![];
 
@@ -570,7 +575,7 @@ impl Planner {
                 for (pos, expr) in elem.iter().enumerate() {
                     match expr {
                         SQLExpr::Value(value) => {
-                            if let Expr::Literal(value) = self.value(value)? {
+                            if let Expr::Literal(value) = self.value(&value.value)? {
                                 values.push(value);
                             } else {
                                 return array_literal_error(pos, expr);
@@ -580,7 +585,11 @@ impl Planner {
                             op: UnaryOperator::Minus,
                             expr,
                         } => {
-                            if let SQLExpr::Value(Value::Number(number, _)) = expr.as_ref() {
+                            if let SQLExpr::Value(ValueWithSpan {
+                                value: Value::Number(number, _),
+                                ..
+                            }) = expr.as_ref()
+                            {
                                 if let Expr::Literal(value) = self.number(number, true)? {
                                     values.push(value);
                                 } else {
@@ -629,8 +638,9 @@ impl Planner {
             }
             // For example, DATE '2020-01-01'
             SQLExpr::TypedString { data_type, value } => {
+                let value = value.clone().into_string().expect_ok()?;
                 Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value.clone())))),
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)))),
                     data_type: self.parse_type(data_type)?,
                 }))
             }
@@ -686,66 +696,52 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            SQLExpr::MapAccess { column, keys } => {
-                let mut expr = self.parse_sql_expr(column)?;
+            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
+                "JSON access is not supported",
+                location!(),
+            )),
+            SQLExpr::CompoundFieldAccess { root, access_chain } => {
+                let mut expr = self.parse_sql_expr(root)?;
 
-                for key in keys {
-                    let field_access = match &key.key {
-                        SQLExpr::Value(
-                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        ) => GetFieldAccess::NamedStructField {
+                for access in access_chain {
+                    let field_access = match access {
+                        // x.y or x['y']
+                        AccessExpr::Dot(SQLExpr::Identifier(Ident { value: s, .. }))
+                        | AccessExpr::Subscript(Subscript::Index {
+                            index:
+                                SQLExpr::Value(ValueWithSpan {
+                                    value:
+                                        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                                    ..
+                                }),
+                        }) => GetFieldAccess::NamedStructField {
                             name: ScalarValue::from(s.as_str()),
                         },
-                        SQLExpr::JsonAccess { .. } => {
-                            return Err(Error::invalid_input(
-                                "JSON access is not supported",
-                                location!(),
-                            ));
-                        }
-                        key => {
-                            let key = Box::new(self.parse_sql_expr(key)?);
+                        AccessExpr::Subscript(Subscript::Index { index }) => {
+                            let key = Box::new(self.parse_sql_expr(index)?);
                             GetFieldAccess::ListIndex { key }
                         }
-                    };
-
-                    let field_access_expr = RawFieldAccessExpr { expr, field_access };
-
-                    expr = self.plan_field_access(field_access_expr)?;
-                }
-
-                Ok(expr)
-            }
-            SQLExpr::Subscript { expr, subscript } => {
-                let expr = self.parse_sql_expr(expr)?;
-
-                let field_access = match subscript.as_ref() {
-                    Subscript::Index { index } => match index {
-                        SQLExpr::Value(
-                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        ) => GetFieldAccess::NamedStructField {
-                            name: ScalarValue::from(s.as_str()),
-                        },
-                        SQLExpr::JsonAccess { .. } => {
+                        AccessExpr::Subscript(Subscript::Slice { .. }) => {
                             return Err(Error::invalid_input(
-                                "JSON access is not supported",
+                                "Slice subscript is not supported",
                                 location!(),
                             ));
                         }
                         _ => {
-                            let key = Box::new(self.parse_sql_expr(index)?);
-                            GetFieldAccess::ListIndex { key }
+                            // Handle other cases like JSON access
+                            // Note: JSON access is not supported in lance
+                            return Err(Error::invalid_input(
+                                "Only dot notation or index access is supported for field access",
+                                location!(),
+                            ));
                         }
-                    },
-                    Subscript::Slice { .. } => {
-                        return Err(Error::invalid_input(
-                            "Slice subscript is not supported",
-                            location!(),
-                        ));
-                    }
-                };
+                    };
 
-                let field_access_expr = RawFieldAccessExpr { expr, field_access };
-                self.plan_field_access(field_access_expr)
+                    let field_access_expr = RawFieldAccessExpr { expr, field_access };
+                    expr = self.plan_field_access(field_access_expr)?;
+                }
+
+                Ok(expr)
             }
             SQLExpr::Between {
                 expr,
@@ -782,8 +778,13 @@ impl Planner {
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        let resolved = resolve_expr(&expr, &schema)?;
-        coerce_filter_type_to_boolean(resolved)
+        let resolved = resolve_expr(&expr, &schema).map_err(|e| {
+            Error::invalid_input(
+                format!("Error resolving filter expression {filter}: {e}"),
+                location!(),
+            )
+        })?;
+        Ok(coerce_filter_type_to_boolean(resolved))
     }
 
     /// Create Logical [Expr] from a SQL expression.
@@ -805,7 +806,7 @@ impl Planner {
     /// TODO: use SqlToRel from Datafusion directly?
     fn try_decode_hex_literal(s: &str) -> Option<Vec<u8>> {
         let hex_bytes = s.as_bytes();
-        let mut decoded_bytes = Vec::with_capacity((hex_bytes.len() + 1) / 2);
+        let mut decoded_bytes = Vec::with_capacity(hex_bytes.len().div_ceil(2));
 
         let start_idx = hex_bytes.len() % 2;
         if start_idx > 0 {
@@ -1045,20 +1046,14 @@ mod tests {
             }
         }
 
-        let expected = Expr::Column(Column {
-            relation: None,
-            name: "s0".to_string(),
-        });
+        let expected = Expr::Column(Column::new_unqualified("s0"));
         assert_column_eq(&planner, "s0", &expected);
         assert_column_eq(&planner, "`s0`", &expected);
 
         let expected = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
-                Expr::Column(Column {
-                    relation: None,
-                    name: "st".to_string(),
-                }),
+                Expr::Column(Column::new_unqualified("st")),
                 Expr::Literal(ScalarValue::Utf8(Some("s1".to_string()))),
             ],
         });
@@ -1072,10 +1067,7 @@ mod tests {
                 Expr::ScalarFunction(ScalarFunction {
                     func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
                     args: vec![
-                        Expr::Column(Column {
-                            relation: None,
-                            name: "st".to_string(),
-                        }),
+                        Expr::Column(Column::new_unqualified("st")),
                         Expr::Literal(ScalarValue::Utf8(Some("st".to_string()))),
                     ],
                 }),
@@ -1609,9 +1601,7 @@ mod tests {
         ];
 
         let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
-            std::iter::repeat(Some(false))
-                .take(5)
-                .chain(std::iter::repeat(Some(true)).take(5)),
+            std::iter::repeat_n(Some(false), 5).chain(std::iter::repeat_n(Some(true), 5)),
         ));
         for expression in expressions {
             // convert to physical expression

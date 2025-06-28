@@ -11,6 +11,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use lance_core::error::{box_error, CorruptFileSnafu};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -19,7 +20,7 @@ use roaring::bitmap::RoaringBitmap;
 use snafu::{location, ResultExt};
 use tracing::{info, instrument};
 
-use crate::format::{DeletionFile, DeletionFileType, Fragment};
+use crate::format::{DeletionFile, DeletionFileType};
 
 pub(crate) const DELETION_DIRS: &str = "_deletions";
 
@@ -90,7 +91,7 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            info!(target: "file_audit", mode="create", type="deletion", path = path.to_string());
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
 
             Some(deletion_file)
         }
@@ -109,7 +110,7 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            info!(target: "file_audit", mode="create", type="deletion", path = path.to_string());
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
 
             Some(deletion_file)
         }
@@ -117,26 +118,27 @@ pub async fn write_deletion_file(
     Ok(deletion_file)
 }
 
-/// Read a deletion file for a fragment.
-///
-/// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
-///
-/// Will return an error if the file is present but invalid.
-#[instrument(level = "debug", skip_all)]
+#[instrument(
+    level = "debug",
+    skip(base, object_store),
+    fields(
+        base = base.as_ref(),
+        bytes_read = tracing::field::Empty
+    )
+)]
 pub async fn read_deletion_file(
+    fragment_id: u64,
+    deletion_file: &DeletionFile,
     base: &Path,
-    fragment: &Fragment,
     object_store: &ObjectStore,
-) -> Result<Option<DeletionVector>> {
-    let Some(deletion_file) = &fragment.deletion_file else {
-        return Ok(None);
-    };
-
+) -> Result<DeletionVector> {
+    let span = tracing::Span::current();
     match deletion_file.file_type {
         DeletionFileType::Array => {
-            let path = deletion_file_path(base, fragment.id, deletion_file);
+            let path = deletion_file_path(base, fragment_id, deletion_file);
 
             let data = object_store.read_one_all(&path).await?;
+            span.record("bytes_read", data.len());
             let data = std::io::Cursor::new(data);
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
@@ -188,12 +190,13 @@ pub async fn read_deletion_file(
                 }
             }
 
-            Ok(Some(DeletionVector::Set(set)))
+            Ok(DeletionVector::Set(set))
         }
         DeletionFileType::Bitmap => {
-            let path = deletion_file_path(base, fragment.id, deletion_file);
+            let path = deletion_file_path(base, fragment_id, deletion_file);
 
             let data = object_store.read_one_all(&path).await?;
+            span.record("bytes_read", data.len());
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
@@ -202,7 +205,7 @@ pub async fn read_deletion_file(
                     location: location!(),
                 })?;
 
-            Ok(Some(DeletionVector::Bitmap(bitmap)))
+            Ok(DeletionVector::Bitmap(bitmap))
         }
     }
 }
@@ -334,11 +337,8 @@ mod test {
             .await
             .unwrap();
 
-        let mut fragment = Fragment::new(fragment_id);
-        fragment.deletion_file = file;
-        let read_dv = read_deletion_file(&path, &fragment, &object_store)
+        let read_dv = read_deletion_file(fragment_id, &file.unwrap(), &path, &object_store)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(read_dv, dv);
     }
@@ -356,11 +356,8 @@ mod test {
             .await
             .unwrap();
 
-        let mut fragment = Fragment::new(fragment_id);
-        fragment.deletion_file = file;
-        let read_dv = read_deletion_file(&path, &fragment, &object_store)
+        let read_dv = read_deletion_file(fragment_id, &file.unwrap(), &path, &object_store)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(read_dv, dv);
     }

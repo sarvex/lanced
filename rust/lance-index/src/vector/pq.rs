@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
@@ -275,7 +275,11 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
+            0,
         );
+
+        let diff = self.num_sub_vectors as f32 - 1.0;
+        let distances = distances.into_iter().map(|d| d - diff).collect::<Vec<_>>();
         Ok(distances.into())
     }
 
@@ -335,6 +339,7 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code,
+            100,
         ))
     }
 
@@ -395,6 +400,18 @@ impl Quantization for ProductQuantizer {
         params.build(data, distance_type)
     }
 
+    fn retrain(&mut self, data: &dyn Array) -> Result<()> {
+        assert_eq!(data.null_count(), 0);
+        let params = PQBuildParams::with_codebook(
+            self.num_sub_vectors,
+            self.num_bits as usize,
+            Arc::new(self.codebook.clone()),
+        );
+
+        *self = params.build(data, self.distance_type)?;
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.num_sub_vectors
     }
@@ -435,28 +452,29 @@ impl Quantization for ProductQuantizer {
         QuantizationType::Product
     }
 
-    fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+    fn metadata(&self, args: Option<QuantizationMetadata>) -> Self::Metadata {
         let codebook_position = match &args {
             Some(args) => args.codebook_position,
             None => Some(0),
         };
-        let codebook_position = codebook_position.ok_or(Error::Index {
-            message: "codebook_position not found".to_owned(),
-            location: location!(),
-        })?;
-        let tensor = pb::Tensor::try_from(&self.codebook)?;
-        Ok(serde_json::to_value(ProductQuantizationMetadata {
+
+        let codebook_position = codebook_position.expect("codebook position should be set");
+        ProductQuantizationMetadata {
             codebook_position,
-            num_bits: self.num_bits,
+            nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
-            codebook: None,
-            codebook_tensor: tensor.encode_to_vec(),
+            codebook: Some(self.codebook.clone()),
+            codebook_tensor: Vec::new(),
             transposed: args.map(|args| args.transposed).unwrap_or_default(),
-        })?)
+        }
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         let codebook = match metadata.codebook.as_ref() {
             Some(fsl) => fsl.clone(),
             None => {
@@ -466,11 +484,23 @@ impl Quantization for ProductQuantizer {
         };
         Ok(Quantizer::Product(Self::new(
             metadata.num_sub_vectors,
-            metadata.num_bits,
+            metadata.nbits,
             metadata.dimension,
             codebook,
             distance_type,
         )))
+    }
+
+    fn field(&self) -> Field {
+        let num_bytes_per_sub_vector = self.num_sub_vectors * self.num_bits as usize / 8;
+        Field::new(
+            PQ_CODE_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                num_bytes_per_sub_vector as i32,
+            ),
+            true,
+        )
     }
 }
 
@@ -506,7 +536,7 @@ impl TryFrom<Quantizer> for ProductQuantizer {
 mod tests {
     use super::*;
 
-    use std::iter::repeat;
+    use std::iter::repeat_n;
 
     use approx::assert_relative_eq;
     use arrow::datatypes::UInt8Type;
@@ -525,7 +555,7 @@ mod tests {
             8,
             16,
             FixedSizeListArray::try_new_from_values(
-                Float16Array::from_iter_values(repeat(f16::zero()).take(256 * 16)),
+                Float16Array::from_iter_values(repeat_n(f16::zero(), 256 * 16)),
                 16,
             )
             .unwrap(),

@@ -39,6 +39,7 @@ pub mod utils;
 pub mod v3;
 
 use super::pb;
+use crate::metrics::MetricsCollector;
 use crate::{prefilter::PreFilter, Index};
 pub use residual::RESIDUAL_COLUMN;
 
@@ -49,6 +50,7 @@ pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
+pub const LOSS_METADATA_KEY: &str = "_loss";
 
 lazy_static! {
     pub static ref VECTOR_RESULT_SCHEMA: arrow_schema::SchemaRef =
@@ -56,6 +58,8 @@ lazy_static! {
             Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
             ROW_ID_FIELD.clone(),
         ]));
+    pub static ref PART_ID_FIELD: arrow_schema::Field =
+        arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true);
 }
 
 /// Query parameters for the vector indices
@@ -76,8 +80,13 @@ pub struct Query {
     /// The upper bound (exclusive) of the distance to be searched.
     pub upper_bound: Option<f32>,
 
-    /// The number of probes to load and search.
-    pub nprobes: usize,
+    /// The minimum number of probes to load and search.  More partitions
+    /// will only be loaded if we have not found k results.
+    pub minimum_nprobes: usize,
+
+    /// The maximum number of probes to load and search.  If not set then
+    /// ALL partitions will be searched, if needed, to satisfy k results.
+    pub maximum_nprobes: Option<usize>,
 
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
@@ -117,11 +126,16 @@ impl From<DistanceType> for pb::VectorMetricType {
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
-/// It's always the IVF index, any other index types without partitioning will be treated as IVF with one partition.
+///
+/// Vector indices are often built as a chain of indices.  For example, IVF -> PQ
+/// or IVF -> HNSW -> SQ.
+///
+/// We use one trait for both the top-level and the sub-indices.  Typically the top-level
+/// search is a partition-aware search and all sub-indices are whole-index searches.
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
 pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
-    /// Search the vector for nearest neighbors.
+    /// Search entire index for k nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
     ///
@@ -135,19 +149,37 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// ```
     ///
     /// The `pre_filter` argument is used to filter out row ids that we know are
-    /// not relevant to the query. For example, it removes deleted rows.
-    ///
-    /// *WARNINGS*:
-    ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch>;
+    /// not relevant to the query. For example, it removes deleted rows or rows that
+    /// do not match a user-provided filter.
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch>;
 
+    /// Find partitions that may contain nearest neighbors.
+    ///
+    /// If maximum_nprobes is set then this method will return the partitions
+    /// that are most likely to contain the nearest neighbors (e.g. the closest
+    /// partitions to the query vector).
+    ///
+    /// The results should be in sorted order from closest to farthest.
     fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
 
+    /// Get the total number of partitions in the index.
+    fn total_partitions(&self) -> usize;
+
+    /// Search a single partition for nearest neighbors.
+    ///
+    /// This method should return the same results as [`VectorIndex::search`] method except
+    /// that it will only search a single partition.
     async fn search_in_partition(
         &self,
         partition_id: usize,
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
@@ -156,10 +188,6 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// Use residual vector to search.
     fn use_residual(&self) -> bool;
-
-    /// If the index can be remapped return Ok.  Else return an error
-    /// explaining why not
-    fn check_can_remap(&self) -> Result<()>;
 
     // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()>;
     // async fn merge(&self, indices: Vec<Arc<dyn VectorIndex>>) -> Result<()>;
@@ -188,12 +216,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         &self,
         _partition_id: usize,
         _with_vector: bool,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
     }
 
     // for SubIndex only
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
+
+    fn num_rows(&self) -> u64;
 
     /// Return the IDs of rows in the index.
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
@@ -225,7 +256,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
 
-    fn ivf_model(&self) -> IvfModel;
+    fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
 
     /// the index type of this vector index.

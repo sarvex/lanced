@@ -10,6 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::ROW_ID;
+use lance_index::vector::storage::DistCalculator;
 use lance_index::vector::{
     sq::storage::ScalarQuantizationStorage, storage::VectorStore, SQ_CODE_COLUMN,
 };
@@ -76,6 +77,7 @@ pub fn bench_storage(c: &mut Criterion) {
             DistanceType::L2,
             -1.0..1.0,
             repeat_with(|| create_sq_batch(0..(TOTAL / num_chunks) as u64, 512)).take(num_chunks),
+            None,
         )
         .unwrap();
         c.bench_function(
@@ -85,7 +87,7 @@ pub fn bench_storage(c: &mut Criterion) {
                 b.iter(|| {
                     let a = rng.gen_range(0..total as u32);
                     let b = rng.gen_range(0..total as u32);
-                    storage.distance_between(a, b)
+                    storage.dist_calculator_from_id(a).distance(b);
                 });
             },
         );

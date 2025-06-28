@@ -1,30 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
+
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use async_trait::async_trait;
+use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
-    physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
+    physical_plan::{
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet, Time},
+        stream::RecordBatchStreamAdapter,
+        SendableRecordBatchStream,
+    },
 };
 use datafusion_common::DataFusionError;
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Result;
-use tokio::task::{spawn, spawn_blocking};
+use tokio::task::spawn;
 
-fn background_iterator<I: Iterator + Send + 'static>(iter: I) -> impl Stream<Item = I::Item>
-where
-    I::Item: Send,
-{
-    stream::unfold(iter, |mut iter| {
-        spawn_blocking(|| iter.next().map(|val| (val, iter)))
-            .unwrap_or_else(|err| panic!("{}", err))
-    })
-    .fuse()
-}
+pub mod background_iterator;
 
 /// A trait for [BatchRecord] iterators, readers and streams
 /// that can be converted to a concrete stream type [SendableRecordBatchStream].
@@ -145,7 +143,80 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
     let arrow_schema = batches.arrow_schema();
     let stream = RecordBatchStreamAdapter::new(
         arrow_schema,
-        background_iterator(batches).map_err(DataFusionError::from),
+        BackgroundIterator::new(batches)
+            .fuse()
+            .map_err(DataFusionError::from),
     );
     Box::pin(stream)
 }
+
+pub trait MetricsExt {
+    fn find_count(&self, name: &str) -> Option<Count>;
+    fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)>;
+}
+
+impl MetricsExt for MetricsSet {
+    fn find_count(&self, metric_name: &str) -> Option<Count> {
+        self.iter().find_map(|m| match m.value() {
+            MetricValue::Count { name, count } => {
+                if name == metric_name {
+                    Some(count.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    }
+
+    fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)> {
+        self.iter().filter_map(|m| match m.value() {
+            MetricValue::Count { name, count } => Some((name, count)),
+            _ => None,
+        })
+    }
+}
+
+pub trait ExecutionPlanMetricsSetExt {
+    fn new_count(&self, name: &'static str, partition: usize) -> Count;
+    fn new_time(&self, name: &'static str, partition: usize) -> Time;
+}
+
+impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
+    fn new_count(&self, name: &'static str, partition: usize) -> Count {
+        let count = Count::new();
+        MetricBuilder::new(self)
+            .with_partition(partition)
+            .build(MetricValue::Count {
+                name: Cow::Borrowed(name),
+                count: count.clone(),
+            });
+        count
+    }
+
+    fn new_time(&self, name: &'static str, partition: usize) -> Time {
+        let time = Time::new();
+        MetricBuilder::new(self)
+            .with_partition(partition)
+            .build(MetricValue::Time {
+                name: Cow::Borrowed(name),
+                time: time.clone(),
+            });
+        time
+    }
+}
+
+// Common metrics
+pub const IOPS_METRIC: &str = "iops";
+pub const REQUESTS_METRIC: &str = "requests";
+pub const BYTES_READ_METRIC: &str = "bytes_read";
+pub const INDICES_LOADED_METRIC: &str = "indices_loaded";
+pub const PARTS_LOADED_METRIC: &str = "parts_loaded";
+pub const PARTITIONS_RANKED_METRIC: &str = "partitions_ranked";
+pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
+pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
+pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
+pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
+pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";
+pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
+pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";

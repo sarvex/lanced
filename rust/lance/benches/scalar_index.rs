@@ -10,11 +10,12 @@ use arrow_array::{
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use lance::{io::ObjectStore, Dataset};
-use lance_core::{cache::FileMetadataCache, Result};
+use lance_core::{cache::LanceCache, Result};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
     flat::FlatIndexMetadata,
@@ -63,11 +64,14 @@ impl BenchmarkFixture {
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
         let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
         Arc::new(LanceIndexStore::new(
             object_store,
             test_path,
-            FileMetadataCache::no_cache(),
+            Arc::new(LanceCache::no_cache()),
         ))
     }
 
@@ -126,7 +130,10 @@ async fn baseline_equality_search(fixture: &BenchmarkFixture) {
 
 async fn warm_indexed_equality_search(index: &BTreeIndex) {
     let result = index
-        .search(&SargableQuery::Equals(ScalarValue::UInt32(Some(10000))))
+        .search(
+            &SargableQuery::Equals(ScalarValue::UInt32(Some(10000))),
+            &NoOpMetricsCollector,
+        )
         .await
         .unwrap();
     let SearchResult::Exact(row_ids) = result else {
@@ -155,10 +162,13 @@ async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
 
 async fn warm_indexed_inequality_search(index: &BTreeIndex) {
     let result = index
-        .search(&SargableQuery::Range(
-            std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
-            std::ops::Bound::Unbounded,
-        ))
+        .search(
+            &SargableQuery::Range(
+                std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
+                std::ops::Bound::Unbounded,
+            ),
+            &NoOpMetricsCollector,
+        )
         .await
         .unwrap();
     let SearchResult::Exact(row_ids) = result else {
@@ -171,12 +181,15 @@ async fn warm_indexed_inequality_search(index: &BTreeIndex) {
 
 async fn warm_indexed_isin_search(index: &BTreeIndex) {
     let result = index
-        .search(&SargableQuery::IsIn(vec![
-            ScalarValue::UInt32(Some(10000)),
-            ScalarValue::UInt32(Some(50000000)),
-            ScalarValue::UInt32(Some(150000000)), // Not found
-            ScalarValue::UInt32(Some(287123)),
-        ]))
+        .search(
+            &SargableQuery::IsIn(vec![
+                ScalarValue::UInt32(Some(10000)),
+                ScalarValue::UInt32(Some(50000000)),
+                ScalarValue::UInt32(Some(150000000)), // Not found
+                ScalarValue::UInt32(Some(287123)),
+            ]),
+            &NoOpMetricsCollector,
+        )
         .await
         .unwrap();
     let SearchResult::Exact(row_ids) = result else {
@@ -206,7 +219,7 @@ fn bench_warm_indexed(c: &mut Criterion) {
     let fixture = rt.block_on(BenchmarkFixture::open());
 
     let index = rt
-        .block_on(BTreeIndex::load(fixture.index_store.clone()))
+        .block_on(BTreeIndex::load(fixture.index_store.clone(), None))
         .unwrap();
 
     c.bench_function("windexed_equality", |b| {

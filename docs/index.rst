@@ -39,15 +39,40 @@ Preview releases receive the same level of testing as regular releases.
 
 
 .. toctree::
-   :maxdepth: 1
+   :caption: Introduction
+   :maxdepth: 2
 
    Quickstart <./notebooks/quickstart>
-   ./read_and_write
-   Lance Formats <./format>
-   Arrays <./arrays>
+   ./introduction/read_and_write
+   ./introduction/schema_evolution
+
+.. toctree::
+   :caption: Advanced Usage
+   :maxdepth: 1
+
+   Lance Format Spec <./format>
    Blob API <./blob>
-   Integrations <./integrations/integrations>
+   ./tags
+   Object Store Configuration <./object_store>
+   Distributed Write <./distributed_write>
    Performance Guide <./performance>
+   Tokenizer <./tokenizer>
+   Extension Arrays <./arrays>
+
+.. toctree::
+   :caption: Integrations
+
+   Huggingface <./integrations/huggingface>
+   Tensorflow <./integrations/tensorflow>
+   PyTorch <./integrations/pytorch>
+   Ray <./integrations/ray>
+   Spark <https://lancedb.github.io/lance-spark>
+   Trino <https://github.com/lancedb/lance-trino>
+   PostgreSQL <https://github.com/lancedb/pglance>
+
+.. toctree::
+   :maxdepth: 1
+
    API References <./api/api>
    Contributor Guide <./contributing>
    Examples <./examples/examples>

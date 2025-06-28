@@ -19,10 +19,10 @@ use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use crate::{Index, IndexType};
-
 use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
-use super::{AnyQuery, SargableQuery, SearchResult};
+use super::{AnyQuery, MetricsCollector, SargableQuery, SearchResult};
+use crate::frag_reuse::FragReuseIndex;
+use crate::{Index, IndexType};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -174,6 +174,11 @@ impl Index for FlatIndex {
         IndexType::Scalar
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // There is nothing to pre-warm
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
             "num_values": self.data.num_rows(),
@@ -195,7 +200,12 @@ impl Index for FlatIndex {
 
 #[async_trait]
 impl ScalarIndex for FlatIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        metrics.record_comparisons(self.data.num_rows());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
@@ -300,10 +310,16 @@ impl ScalarIndex for FlatIndex {
     // Note that there is no write/train method for flat index at the moment and so it isn't
     // really possible for this method to be called.  If there was we assume it will write all
     // data as a single batch named data.lance
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<Self>> {
         let batches = store.open_index_file("data.lance").await?;
         let num_rows = batches.num_rows();
-        let batch = batches.read_range(0..num_rows, None).await?;
+        let mut batch = batches.read_range(0..num_rows, None).await?;
+        if let Some(fri_ref) = fri.as_ref() {
+            batch = fri_ref.remap_row_ids_record_batch(batch, 1)?;
+        }
         let has_nulls = batch.column(0).null_count() > 0;
         Ok(Arc::new(Self {
             data: Arc::new(batch),
@@ -338,6 +354,8 @@ impl ScalarIndex for FlatIndex {
 
 #[cfg(test)]
 mod tests {
+    use crate::metrics::NoOpMetricsCollector;
+
     use super::*;
     use arrow_array::types::Int32Type;
     use datafusion_common::ScalarValue;
@@ -361,7 +379,7 @@ mod tests {
 
     async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
-        let actual = index.search(query).await.unwrap();
+        let actual = index.search(query, &NoOpMetricsCollector).await.unwrap();
         let SearchResult::Exact(actual_row_ids) = actual else {
             panic! {"Expected exact search result"}
         };

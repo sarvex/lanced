@@ -71,9 +71,12 @@ mod test {
     use deepsize::DeepSizeOf;
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::{FileWriter, FileWriterOptions};
-    use lance_index::vector::ivf::storage::IvfModel;
-    use lance_index::vector::quantizer::{QuantizationType, Quantizer};
     use lance_index::vector::v3::subindex::SubIndexType;
+    use lance_index::{
+        metrics::MetricsCollector,
+        vector::quantizer::{QuantizationType, Quantizer},
+    };
+    use lance_index::{metrics::NoOpMetricsCollector, vector::ivf::storage::IvfModel};
     use lance_index::{
         vector::{hnsw::VECTOR_ID_FIELD, Query},
         DatasetIndexExt, Index, IndexMetadata, IndexType, INDEX_FILE_NAME,
@@ -109,6 +112,10 @@ mod test {
             Ok(self)
         }
 
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(json!(()))
         }
@@ -124,11 +131,20 @@ mod test {
 
     #[async_trait::async_trait]
     impl VectorIndex for MockIndex {
-        async fn search(&self, _: &Query, _: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+        async fn search(
+            &self,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+            _: &dyn MetricsCollector,
+        ) -> Result<RecordBatch> {
             unimplemented!()
         }
 
         fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+            unimplemented!()
+        }
+
+        fn total_partitions(&self) -> usize {
             unimplemented!()
         }
 
@@ -137,6 +153,7 @@ mod test {
             _: usize,
             _: &Query,
             _: Arc<dyn PreFilter>,
+            _: &dyn MetricsCollector,
         ) -> Result<RecordBatch> {
             unimplemented!()
         }
@@ -149,16 +166,16 @@ mod test {
             true
         }
 
-        fn check_can_remap(&self) -> Result<()> {
-            Ok(())
-        }
-
         async fn load(
             &self,
             _: Arc<dyn Reader>,
             _: usize,
             _: usize,
         ) -> Result<Box<dyn VectorIndex>> {
+            unimplemented!()
+        }
+
+        fn num_rows(&self) -> u64 {
             unimplemented!()
         }
 
@@ -174,7 +191,7 @@ mod test {
             unimplemented!()
         }
 
-        fn ivf_model(&self) -> IvfModel {
+        fn ivf_model(&self) -> &IvfModel {
             unimplemented!()
         }
         fn quantizer(&self) -> Quantizer {
@@ -365,7 +382,7 @@ mod test {
 
         // trying to open the index should fail as there is no extension loader
         assert!(ds_without_extension
-            .open_vector_index("vec", &index_uuid)
+            .open_vector_index("vec", &index_uuid, &NoOpMetricsCollector)
             .await
             .unwrap_err()
             .to_string()
@@ -373,7 +390,7 @@ mod test {
 
         // trying to open the index should succeed with the extension loader
         let vector_index = ds_with_extension
-            .open_vector_index("vec", &index_uuid)
+            .open_vector_index("vec", &index_uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 

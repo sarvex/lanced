@@ -51,6 +51,14 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
+    #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
+    RetryableCommitConflict {
+        version: u64,
+        source: BoxedError,
+        location: Location,
+    },
+    #[snafu(display("Too many concurrent writers. {message}, {location}"))]
+    TooMuchWriteContention { message: String, location: Location },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}, {location}"))]
     Internal { message: String, location: Location },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
@@ -148,6 +156,24 @@ impl Error {
             minor_version,
             location,
         }
+    }
+}
+
+pub trait LanceOptionExt<T> {
+    /// Unwraps an option, returning an internal error if the option is None.
+    ///
+    /// Can be used when an option is expected to have a value.
+    fn expect_ok(self) -> Result<T>;
+}
+
+impl<T> LanceOptionExt<T> for Option<T> {
+    #[track_caller]
+    fn expect_ok(self) -> Result<T> {
+        let location = std::panic::Location::caller().to_snafu_location();
+        self.ok_or_else(|| Error::Internal {
+            message: "Expected option to have value".to_string(),
+            location,
+        })
     }
 }
 

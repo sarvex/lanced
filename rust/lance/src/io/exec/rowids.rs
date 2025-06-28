@@ -9,10 +9,11 @@ use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::StreamExt;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::{ROW_ADDR_FIELD, ROW_ID};
 use lance_table::rowids::RowIdIndex;
 
@@ -26,6 +27,7 @@ use super::utils::InstrumentedRecordBatchStreamAdapter;
 ///
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
 /// useful when reading secondary indices, which only have the `_rowid` column.
+#[derive(Clone)]
 pub struct AddRowAddrExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
@@ -158,58 +160,12 @@ impl AddRowAddrExec {
             Ok(row_ids.clone())
         }
     }
-}
 
-impl DisplayAs for AddRowAddrExec {
-    fn fmt_as(
-        &self,
-        _format_type: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "AddRowAddrExec")
-    }
-}
-
-impl ExecutionPlan for AddRowAddrExec {
-    fn name(&self) -> &str {
-        "AddRowAddrExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn schema(&self) -> Arc<Schema> {
-        self.output_schema.clone()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            Err(DataFusionError::Internal(
-                "AddRowAddrExec: invalid number of children".into(),
-            ))
-        } else {
-            Ok(Arc::new(Self::try_new(
-                children.into_iter().next().unwrap(),
-                self.dataset.clone(),
-                self.rowaddr_pos,
-            )?))
-        }
-    }
-
-    fn execute(
+    fn do_execute(
         &self,
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let index_prereq = self
             .row_id_index
             .get_or_init(|| {
@@ -248,9 +204,72 @@ impl ExecutionPlan for AddRowAddrExec {
         let stream = InstrumentedRecordBatchStreamAdapter::new(
             self.output_schema.clone(),
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         );
         Ok(Box::pin(stream))
+    }
+}
+
+impl DisplayAs for AddRowAddrExec {
+    fn fmt_as(
+        &self,
+        _format_type: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "AddRowAddrExec")
+    }
+}
+
+impl ExecutionPlan for AddRowAddrExec {
+    fn name(&self) -> &str {
+        "AddRowAddrExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.output_schema.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing much work here, best to avoid the thread overhead
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            Err(DataFusionError::Internal(
+                "AddRowAddrExec: invalid number of children".into(),
+            ))
+        } else {
+            Ok(Arc::new(Self::try_new(
+                children.into_iter().next().unwrap(),
+                self.dataset.clone(),
+                self.rowaddr_pos,
+            )?))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.schema();
+        let this = self.clone();
+        let stream = futures::stream::once(async move { this.do_execute(partition, context) });
+        let stream = stream.try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
@@ -304,17 +323,17 @@ impl ExecutionPlan for AddRowAddrExec {
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::{DataType, Field};
-    use datafusion::{physical_plan::memory::MemoryExec, prelude::SessionContext};
+    use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
+    use lance_datafusion::exec::OneShotExec;
 
     use crate::dataset::WriteParams;
 
     use super::*;
 
     async fn apply_to_batch(batch: RecordBatch, dataset: Arc<Dataset>) -> Result<RecordBatch> {
-        let schema = batch.schema();
-        let memory_exec = MemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let memory_exec = OneShotExec::from_batch(batch);
         let exec = AddRowAddrExec::try_new(Arc::new(memory_exec), dataset, 0)?;
         let session = SessionContext::new();
         let task_ctx = session.task_ctx();
@@ -435,12 +454,9 @@ mod test {
         let schema = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
         let batch = RecordBatch::try_new(schema.clone(), vec![rowids.clone()]).unwrap();
 
-        let exec = AddRowAddrExec::try_new(
-            Arc::new(MemoryExec::try_new(&[vec![batch.clone()]], schema.clone(), None).unwrap()),
-            dataset.clone(),
-            0,
-        )
-        .unwrap();
+        let memory_exec =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema, None).unwrap();
+        let exec = AddRowAddrExec::try_new(memory_exec, dataset.clone(), 0).unwrap();
         let stats = exec.statistics().unwrap();
         let result = apply_to_batch(batch, dataset).await.unwrap();
 

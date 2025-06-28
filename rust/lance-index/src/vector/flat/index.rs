@@ -11,6 +11,7 @@ use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
+use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use crate::{
+    metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
         graph::{OrderedFloat, OrderedNode},
@@ -80,27 +82,26 @@ impl IvfSubIndex for FlatIndex {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let dist_calc = storage.dist_calculator(query);
+        metrics.record_comparisons(storage.len());
 
-        let mut res: Vec<_> = match prefilter.is_empty() {
+        let res = match prefilter.is_empty() {
             true => {
                 let iter = dist_calc
-                    .distance_all()
+                    .distance_all(k)
                     .into_iter()
                     .zip(0..storage.len() as u32)
-                    .map(|(dist, id)| OrderedNode {
-                        id,
-                        dist: OrderedFloat(dist),
-                    });
-
-                if params.lower_bound.is_some() || params.upper_bound.is_some() {
+                    .map(|(dist, id)| OrderedNode::new(id, dist.into()));
+                if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
                     iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
-                        .collect()
+                        .sorted_unstable()
                 } else {
-                    iter.collect()
+                    iter.sorted_unstable()
                 }
             }
             false => {
@@ -111,20 +112,18 @@ impl IvfSubIndex for FlatIndex {
                         id: id as u32,
                         dist: OrderedFloat(dist_calc.distance(id as u32)),
                     });
-                if params.lower_bound.is_some() || params.upper_bound.is_some() {
+                if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
                     iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
-                        .collect()
+                        .sorted_unstable()
                 } else {
-                    iter.collect()
+                    iter.sorted_unstable()
                 }
             }
         };
-        res.sort_unstable();
 
         let (row_ids, dists): (Vec<_>, Vec<_>) = res
-            .into_iter()
             .take(k)
             .map(|r| (storage.row_id(r.id), r.dist.0))
             .unzip();
@@ -190,6 +189,10 @@ impl Quantization for FlatQuantizer {
         Ok(Self::new(dim as usize, distance_type))
     }
 
+    fn retrain(&mut self, _: &dyn Array) -> Result<()> {
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.dim
     }
@@ -205,12 +208,8 @@ impl Quantization for FlatQuantizer {
         }))
     }
 
-    fn metadata(
-        &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
-    ) -> Result<serde_json::Value> {
-        let metadata = FlatMetadata { dim: self.dim };
-        Ok(serde_json::to_value(metadata)?)
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
     }
 
     fn metadata_key() -> &'static str {
@@ -223,6 +222,17 @@ impl Quantization for FlatQuantizer {
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
         Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
     }
 }
 
@@ -268,6 +278,10 @@ impl Quantization for FlatBinQuantizer {
         Ok(Self::new(dim as usize, distance_type))
     }
 
+    fn retrain(&mut self, _: &dyn Array) -> Result<()> {
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.dim
     }
@@ -283,12 +297,8 @@ impl Quantization for FlatBinQuantizer {
         }))
     }
 
-    fn metadata(
-        &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
-    ) -> Result<serde_json::Value> {
-        let metadata = FlatMetadata { dim: self.dim };
-        Ok(serde_json::to_value(metadata)?)
+    fn metadata(&self, _: Option<crate::vector::quantizer::QuantizationMetadata>) -> FlatMetadata {
+        FlatMetadata { dim: self.dim }
     }
 
     fn metadata_key() -> &'static str {
@@ -301,6 +311,17 @@ impl Quantization for FlatBinQuantizer {
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
         Ok(vectors.slice(0, vectors.len()))
+    }
+
+    fn field(&self) -> Field {
+        Field::new(
+            FLAT_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                self.dim as i32,
+            ),
+            true,
+        )
     }
 }
 

@@ -25,10 +25,10 @@ use serde_json::json;
 use snafu::location;
 use tracing::instrument;
 
-use crate::prefilter::PreFilter;
 use crate::vector::ivf::storage::IvfModel;
 use crate::vector::quantizer::QuantizationType;
 use crate::vector::v3::subindex::{IvfSubIndex, SubIndexType};
+use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -135,6 +135,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
         }))
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: HNSW can (and should) support pre-warming
+        Ok(())
+    }
+
     /// Get the type of the index
     fn index_type(&self) -> IndexType {
         IndexType::Vector
@@ -152,7 +157,12 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
 #[async_trait]
 impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     #[instrument(level = "debug", skip_all, name = "HNSWIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         let hnsw = self.hnsw.as_ref().ok_or(Error::Index {
             message: "HNSW index not loaded".to_string(),
             location: location!(),
@@ -172,6 +182,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             query.into(),
             storage.as_ref(),
             pre_filter,
+            metrics,
         )
     }
 
@@ -179,11 +190,16 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         unimplemented!("only for IVF")
     }
 
+    fn total_partitions(&self) -> usize {
+        1
+    }
+
     async fn search_in_partition(
         &self,
         _: usize,
         _: &Query,
         _: Arc<dyn PreFilter>,
+        _: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         unimplemented!("only for IVF")
     }
@@ -194,10 +210,6 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
 
     fn use_residual(&self) -> bool {
         self.options.use_residual
-    }
-
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
     }
 
     async fn load(
@@ -293,6 +305,12 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Ok(Box::pin(stream))
     }
 
+    fn num_rows(&self) -> u64 {
+        self.hnsw
+            .as_ref()
+            .map_or(0, |hnsw| hnsw.num_nodes(0) as u64)
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
     }
@@ -304,7 +322,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         })
     }
 
-    fn ivf_model(&self) -> IvfModel {
+    fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
 

@@ -100,22 +100,20 @@ fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array) -> bool
 where
     T::Native: Float,
 {
-    !arr.as_primitive::<T>()
-        .values()
-        .iter()
-        .any(|&v| !v.is_finite())
+    arr.null_count() == 0
+        && !arr
+            .as_primitive::<T>()
+            .values()
+            .iter()
+            .any(|&v| !v.is_finite())
 }
 
 impl Transformer for KeepFiniteVectors {
     #[instrument(name = "KeepFiniteVectors::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
-            message: format!(
-                "KeepFiniteVectors: column {} not found in RecordBatch",
-                self.column
-            ),
-            location: location!(),
-        })?;
+        let Some(arr) = batch.column_by_name(&self.column) else {
+            return Ok(batch.clone());
+        };
 
         let data = match arr.data_type() {
             DataType::FixedSizeList(_, _) => arr.as_fixed_size_list(),
@@ -139,6 +137,8 @@ impl Transformer for KeepFiniteVectors {
                     DataType::Float16 => is_all_finite::<Float16Type>(&data),
                     DataType::Float32 => is_all_finite::<Float32Type>(&data),
                     DataType::Float64 => is_all_finite::<Float64Type>(&data),
+                    DataType::UInt8 => data.null_count() == 0,
+                    DataType::Int8 => data.null_count() == 0,
                     _ => false,
                 };
                 if is_valid {
@@ -189,23 +189,23 @@ impl Flatten {
 
 impl Transformer for Flatten {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
-            message: format!("Flatten: column {} not found in RecordBatch", self.column),
-            location: location!(),
-        })?;
+        let Some(arr) = batch.column_by_name(&self.column) else {
+            // this case is that we have precomputed buffers,
+            // so we don't need to flatten the original vectors.
+            return Ok(batch.clone());
+        };
         match arr.data_type() {
-            DataType::FixedSizeList(_, _) => {
-                // do nothing
-                Ok(batch.clone())
-            }
+            DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();
 
                 let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
                     |(row_id, multivector)| {
-                        std::iter::repeat(*row_id)
-                            .take(multivector.map(|multivec| multivec.len()).unwrap_or(0))
+                        std::iter::repeat_n(
+                            *row_id,
+                            multivector.map(|multivec| multivec.len()).unwrap_or(0),
+                        )
                     },
                 );
                 let row_ids = UInt64Array::from_iter_values(row_ids);

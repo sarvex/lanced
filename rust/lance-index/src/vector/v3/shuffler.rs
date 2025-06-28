@@ -11,15 +11,13 @@ use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema;
 use future::try_join_all;
 use futures::prelude::*;
-use itertools::Itertools;
-use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::{
-    cache::FileMetadataCache,
+    cache::LanceCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
     Error, Result,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::v2::reader::ReaderProjection;
 use lance_file::v2::{
     reader::{FileReader, FileReaderOptions},
     writer::FileWriter,
@@ -28,12 +26,13 @@ use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
+    utils::CachedFileSize,
 };
 use object_store::path::Path;
 use snafu::location;
 use tokio::sync::Mutex;
 
-use crate::vector::PART_ID_COLUMN;
+use crate::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN};
 
 #[async_trait::async_trait]
 /// A reader that can read the shuffled partitions.
@@ -48,6 +47,12 @@ pub trait ShuffleReader: Send + Sync {
 
     /// Get the size of the partition by partition_id
     fn partition_size(&self, partition_id: usize) -> Result<usize>;
+
+    /// Get the total loss,
+    /// if the loss is not available, return None,
+    /// in such case, the caller should sum up the losses from each batch's metadata.
+    /// Must be called after all partitions are read.
+    fn total_loss(&self) -> Option<f64>;
 }
 
 #[async_trait::async_trait]
@@ -69,6 +74,7 @@ pub struct IvfShuffler {
 
     // options
     buffer_size: usize,
+    precomputed_shuffle_buffers: Option<Vec<String>>,
 }
 
 impl IvfShuffler {
@@ -78,11 +84,20 @@ impl IvfShuffler {
             output_dir,
             num_partitions,
             buffer_size: 4096,
+            precomputed_shuffle_buffers: None,
         }
     }
 
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = buffer_size;
+        self
+    }
+
+    pub fn with_precomputed_shuffle_buffers(
+        mut self,
+        precomputed_shuffle_buffers: Option<Vec<String>>,
+    ) -> Self {
+        self.precomputed_shuffle_buffers = precomputed_shuffle_buffers;
         self
     }
 }
@@ -107,18 +122,19 @@ impl Shuffler for IvfShuffler {
                 spawn_cpu(move || {
                     let batch = batch?;
 
-                    let part_ids: &UInt32Array = batch
-                        .column_by_name(PART_ID_COLUMN)
-                        .expect("Partition ID column not found")
-                        .as_primitive();
+                    let loss = batch
+                        .metadata()
+                        .get(LOSS_METADATA_KEY)
+                        .map(|s| s.parse::<f64>().unwrap_or_default())
+                        .unwrap_or_default();
+
+                    let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
 
                     let indices = sort_to_indices(&part_ids, None, None)?;
                     let batch = batch.take(&indices)?;
 
-                    let part_ids: &UInt32Array = batch
-                        .column_by_name(PART_ID_COLUMN)
-                        .expect("Partition ID column not found")
-                        .as_primitive();
+                    let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
+                    let batch = batch.drop_column(PART_ID_COLUMN)?;
 
                     let mut partition_buffers =
                         (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>();
@@ -136,7 +152,7 @@ impl Shuffler for IvfShuffler {
                         start = end;
                     }
 
-                    Ok::<Vec<Vec<RecordBatch>>, Error>(partition_buffers)
+                    Ok::<(Vec<Vec<RecordBatch>>, f64), Error>((partition_buffers, loss))
                 })
             })
             .buffered(get_num_compute_intensive_cpus());
@@ -148,8 +164,10 @@ impl Shuffler for IvfShuffler {
             .collect::<Vec<_>>();
 
         let mut counter = 0;
+        let mut total_loss = 0.0;
         while let Some(shuffled) = parallel_sort_stream.next().await {
-            let shuffled = shuffled?;
+            let (shuffled, loss) = shuffled?;
+            total_loss += loss;
 
             for (part_id, batches) in shuffled.into_iter().enumerate() {
                 let part_batches = &mut partition_buffers[part_id];
@@ -180,7 +198,7 @@ impl Shuffler for IvfShuffler {
                             )
                         }
                     })
-                    .buffered(10)
+                    .buffered(self.object_store.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -220,6 +238,7 @@ impl Shuffler for IvfShuffler {
             self.object_store.clone(),
             self.output_dir.clone(),
             partition_sizes,
+            total_loss,
         )))
     }
 }
@@ -228,6 +247,7 @@ pub struct IvfShufflerReader {
     scheduler: Arc<ScanScheduler>,
     output_dir: Path,
     partition_sizes: Vec<usize>,
+    loss: f64,
 }
 
 impl IvfShufflerReader {
@@ -235,6 +255,7 @@ impl IvfShufflerReader {
         object_store: Arc<ObjectStore>,
         output_dir: Path,
         partition_sizes: Vec<usize>,
+        loss: f64,
     ) -> Self {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
@@ -242,6 +263,7 @@ impl IvfShufflerReader {
             scheduler,
             output_dir,
             partition_sizes,
+            loss,
         }
     }
 }
@@ -255,42 +277,22 @@ impl ShuffleReader for IvfShufflerReader {
         let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
-            self.scheduler.open_file(&partition_path).await?,
+            self.scheduler
+                .open_file(&partition_path, &CachedFileSize::unknown())
+                .await?,
             None,
             Arc::<DecoderPlugins>::default(),
-            &FileMetadataCache::no_cache(),
+            &LanceCache::no_cache(),
             FileReaderOptions::default(),
         )
         .await?;
         let schema: Schema = reader.schema().as_ref().into();
-        let projection = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, f)| {
-                if f.name() != PART_ID_COLUMN {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let schema = schema.project(&projection)?;
-        let projection = ReaderProjection::from_column_names(
-            reader.schema().as_ref(),
-            &schema
-                .field_names()
-                .into_iter()
-                .map(|s| s.as_ref())
-                .collect_vec(),
-        )?;
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            reader.read_stream_projected(
+            reader.read_stream(
                 lance_io::ReadBatchParams::RangeFull,
-                4096,
+                u32::MAX,
                 16,
-                projection,
                 FilterExpression::no_filter(),
             )?,
         ))))
@@ -298,6 +300,10 @@ impl ShuffleReader for IvfShufflerReader {
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        Some(self.loss)
     }
 }
 
@@ -334,5 +340,29 @@ impl ShuffleReader for SinglePartitionReader {
         // it's used for determining the order of building the index and skipping empty partitions
         // so we just return 1 here
         Ok(1)
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        None
+    }
+}
+
+pub struct EmptyReader;
+
+#[async_trait::async_trait]
+impl ShuffleReader for EmptyReader {
+    async fn read_partition(
+        &self,
+        _partition_id: usize,
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+        Ok(None)
+    }
+
+    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn total_loss(&self) -> Option<f64> {
+        None
     }
 }

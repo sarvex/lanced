@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
@@ -20,6 +21,8 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
@@ -35,7 +38,6 @@ use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::location;
 use tracing::{instrument, span, Level};
-
 // Re-export
 pub use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::kernels::normalize_fsl;
@@ -64,6 +66,8 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
+
+    fri: Option<Arc<FragReuseIndex>>,
 }
 
 impl DeepSizeOf for PQIndex {
@@ -96,12 +100,17 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: ProductQuantizer, metric_type: MetricType) -> Self {
+    pub(crate) fn new(
+        pq: ProductQuantizer,
+        metric_type: MetricType,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
         Self {
             code: None,
             row_ids: None,
             pq,
             metric_type,
+            fri,
         }
     }
 
@@ -167,6 +176,11 @@ impl Index for PQIndex {
         IndexType::Vector
     }
 
+    async fn prewarm(&self) -> Result<()> {
+        // TODO: Investigate
+        Ok(())
+    }
+
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_type": "PQ",
@@ -201,7 +215,12 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
@@ -212,6 +231,8 @@ impl VectorIndex for PQIndex {
 
         let code = self.code.as_ref().unwrap().clone();
         let row_ids = self.row_ids.as_ref().unwrap().clone();
+
+        metrics.record_comparisons(row_ids.len());
 
         let pq = self.pq.clone();
         let query = query.clone();
@@ -273,11 +294,16 @@ impl VectorIndex for PQIndex {
         unimplemented!("only for IVF")
     }
 
+    fn total_partitions(&self) -> usize {
+        1
+    }
+
     async fn search_in_partition(
         &self,
         _: usize,
         _: &Query,
         _: Arc<dyn PreFilter>,
+        _: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         unimplemented!("only for IVF")
     }
@@ -323,11 +349,40 @@ impl VectorIndex for PQIndex {
             self.pq.num_sub_vectors,
         );
 
+        let (primitive_row_ids, transposed_pq_codes) = if let Some(fri_ref) = self.fri.as_ref() {
+            let num_vectors = row_ids.len();
+            let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
+            let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
+                .enumerate()
+                .filter_map(|(vec_idx, old_row_id)| {
+                    let new_row_id = fri_ref.remap_row_id(*old_row_id);
+                    new_row_id.map(|new_row_id| {
+                        (
+                            new_row_id,
+                            Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
+                        )
+                    })
+                })
+                .unzip();
+            let transposed_codes = transpose(
+                &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
+                remapped_row_ids.len(),
+                self.pq.num_sub_vectors,
+            );
+            (
+                Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
+                Arc::new(transposed_codes),
+            )
+        } else {
+            (Arc::new(row_ids.as_primitive().clone()), Arc::new(pq_codes))
+        };
+
         Ok(Box::new(Self {
-            code: Some(Arc::new(pq_codes)),
-            row_ids: Some(Arc::new(row_ids.as_primitive().clone())),
+            code: Some(transposed_pq_codes),
+            row_ids: Some(primitive_row_ids),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
+            fri: self.fri.clone(),
         }))
     }
 
@@ -368,12 +423,14 @@ impl VectorIndex for PQIndex {
         Ok(Box::pin(stream))
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
-        todo!("this method is for only IVF_HNSW_* index");
+    fn num_rows(&self) -> u64 {
+        self.row_ids
+            .as_ref()
+            .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn check_can_remap(&self) -> Result<()> {
-        Ok(())
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+        todo!("this method is for only IVF_HNSW_* index");
     }
 
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
@@ -410,7 +467,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn ivf_model(&self) -> IvfModel {
+    fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
     fn quantizer(&self) -> Quantizer {
@@ -553,6 +610,8 @@ pub(crate) fn build_pq_storage(
         pq.dimension,
         distance_type,
         false,
+        // TODO: support auto-remap with FRI for HNSW
+        None,
     )?;
 
     Ok(pq_store)
@@ -610,7 +669,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = IvfModel::new(fsl);
+        let ivf = IvfModel::new(fsl, None);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await

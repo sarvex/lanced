@@ -3,6 +3,89 @@ Lance Performance Guide
 
 This guide provides tips and tricks for optimizing the performance of your Lance applications.
 
+Trace Events
+------------
+
+Lance uses tracing to log events.  If you are running ``pylance`` then these events will be emitted to
+as log messages.  For Rust connections you can use the ``tracing`` crate to capture these events.
+
+File Audit
+~~~~~~~~~~
+
+File audit events are emitted when significant files are created or deleted.
+
+.. list-table::
+   :widths: 20 20 60
+   :header-rows: 1
+
+   * - Event
+     - Parameter
+     - Description
+
+   * - ``lance::file_audit``
+     - ``mode``
+     - The mode of I/O operation (create, delete, delete_unverified)
+   * - ``lance::file_audit``
+     - ``type``
+     - The type of file affected (manifest, data file, index file, deletion file)
+
+I/O Events
+~~~~~~~~~~
+
+I/O events are emitted when significant I/O operations are performed, particularly
+those related to indices.  These events are NOT emitted when the index is loaded from
+the in-memory cache.  Correct cache utilization is important for performance and these
+events are intended to help you debug cache usage.
+
+.. list-table::
+   :widths: 20 20 60
+   :header-rows: 1
+
+   * - Event
+     - Parameter
+     - Description
+
+   * - ``lance::io_events``
+     - ``type``
+     - The type of I/O operation (open_scalar_index, open_vector_index, load_vector_part, load_scalar_part)
+
+Execution Events
+~~~~~~~~~~~~~~~~
+
+Execution events are emitted when an execution plan is run.  These events are useful for
+debugging query performance.
+
+.. list-table::
+   :widths: 20 20 60
+   :header-rows: 1
+
+   * - Event
+     - Parameter
+     - Description
+
+   * - ``lance::execution``
+     - ``type``
+     - The type of execution event (plan_run is the only type today)
+   * - ``lance::execution``
+     - ``output_rows``
+     - The number of rows in the output of the plan
+   * - ``lance::execution``
+     - ``iops``
+     - The number of I/O operations performed by the plan
+   * - ``lance::execution``
+     - ``bytes_read``
+     - The number of bytes read by the plan
+   * - ``lance::execution``
+     - ``indices_loaded``
+     - The number of indices loaded by the plan
+   * - ``lance::execution``
+     - ``parts_loaded``
+     - The number of index partitions loaded by the plan
+   * - ``lance::execution``
+     - ``index_comparisons``
+     - The number of comparisons performed inside the various indices
+
+
 Threading Model
 ---------------
 
@@ -81,3 +164,9 @@ with 1024 rows per batch is more appropriate.
 In summary, scans could use up to ``(2 * io_buffer_size) + (batch_size * num_compute_threads)`` bytes of memory.
 Keep in mind that ``io_buffer_size`` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
+
+The above limits refer to limits per-scan.  There is an additional limit on the number of IOPS that is applied
+across the entire process.  This limit is specified by the ``LANCE_PROCESS_IO_THREADS_LIMIT`` environment variable.
+The default is 128 which is more than enough for most workloads.  You can increase this limit if you are working
+with a high-throughput workload.  You can even disable this limit entirely by setting it to zero.  Note that this
+can often lead to issues with excessive retries and timeouts from the object store.

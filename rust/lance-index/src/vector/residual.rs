@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::iter;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
+use std::{iter, ops::MulAssign};
 
 use arrow_array::ArrowNumericType;
 use arrow_array::{
@@ -21,7 +21,7 @@ use num_traits::{Float, FromPrimitive, Num};
 use snafu::location;
 use tracing::instrument;
 
-use super::transform::Transformer;
+use super::{transform::Transformer, PQ_CODE_COLUMN};
 
 pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 
@@ -64,7 +64,8 @@ fn do_compute_residual<T: ArrowNumericType>(
     partitions: Option<&UInt32Array>,
 ) -> Result<FixedSizeListArray>
 where
-    T::Native: Num + Float + L2 + Dot + DivAssign + AddAssign + FromPrimitive,
+    T::Native: Num + Float + L2 + Dot + MulAssign + DivAssign + AddAssign + FromPrimitive,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let dimension = centroids.value_length() as usize;
     let centroids = centroids.values().as_primitive::<T>();
@@ -77,6 +78,7 @@ where
             dimension,
             distance_type.expect("provide either partitions or distance type"),
         )
+        .0
         .into()
     });
     let part_ids = part_ids.values();
@@ -135,6 +137,13 @@ pub(crate) fn compute_residual(
         (DataType::Float64, DataType::Float64) => {
             do_compute_residual::<Float64Type>(centroids, vectors, distance_type, partitions)
         }
+        (DataType::Float32, DataType::Int8) => {
+            do_compute_residual::<Float32Type>(
+                centroids,
+                &vectors.convert_to_floating_point()?,
+                distance_type,
+                partitions)
+        }
         _ => Err(Error::Index {
             message: format!(
                 "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
@@ -152,6 +161,11 @@ impl Transformer for ResidualTransform {
     /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
     #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
+            // If the PQ code column is present, we don't need to compute residual vectors.
+            return Ok(batch.clone());
+        }
+
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
             message: format!(
                 "Compute residual vector: partition id column not found: {}",
@@ -180,7 +194,16 @@ impl Transformer for ResidualTransform {
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
-        let batch = batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?;
+        let batch = if residual_arr.data_type() != original.data_type() {
+            batch.replace_column_schema_by_name(
+                &self.vec_col,
+                residual_arr.data_type().clone(),
+                Arc::new(residual_arr),
+            )?
+        } else {
+            batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?
+        };
+
         Ok(batch)
     }
 }

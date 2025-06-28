@@ -138,6 +138,7 @@ fn train_pq_model(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
     let codebook = RT.block_on(
         Some(py),
@@ -241,6 +242,7 @@ pub fn transform_vectors(
     )?
 }
 
+#[allow(deprecated)]
 async fn do_shuffle_transformed_vectors(
     unsorted_filenames: Vec<String>,
     dir_path: &str,
@@ -354,6 +356,7 @@ pub fn load_shuffled_vectors(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
 
     let codebook = pq_codebook.0;

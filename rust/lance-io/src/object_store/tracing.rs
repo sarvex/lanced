@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::StreamExt;
+use lance_core::utils::tracing::StreamTracingExt;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
@@ -106,12 +108,12 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         self.target.get_range(location, range).await
     }
 
     #[instrument(level = "debug", skip(self, ranges))]
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.target.get_ranges(location, ranges).await
     }
 
@@ -130,12 +132,15 @@ impl object_store::ObjectStore for TracedObjectStore {
         &'a self,
         locations: BoxStream<'a, OSResult<Path>>,
     ) -> BoxStream<'a, OSResult<Path>> {
-        self.target.delete_stream(locations)
+        self.target
+            .delete_stream(locations)
+            .stream_in_current_span()
+            .boxed()
     }
 
     #[instrument(level = "debug", skip(self))]
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target.list(prefix)
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list(prefix).stream_in_current_span().boxed()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -143,8 +148,11 @@ impl object_store::ObjectStore for TracedObjectStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target.list_with_offset(prefix, offset)
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target
+            .list_with_offset(prefix, offset)
+            .stream_in_current_span()
+            .boxed()
     }
 
     #[instrument(level = "debug", skip(self))]
